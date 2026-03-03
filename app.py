@@ -67,21 +67,22 @@ def auto_adjust_texture_count(image_count, vram_gb=12):
         return min(base_max, 8)
 
 
-def rotate_and_embed_glb(glb_path):
-    """GLBファイルのルートノードにX軸-90度回転を適用し、外部テクスチャを埋め込む
+def rotate_and_pack_glb(glb_path):
+    """GLBファイルのX軸-90度回転＋外部テクスチャをバイナリバッファに統合
 
     1. ビューワー/Blenderで真上から見た状態になる問題を修正する。
-    2. RealityScanが出力した外部テクスチャ（PNG）をBase64としてGLB内に埋め込み、
-       GradioやBlenderでテクスチャが正しく表示されるようにする。
+    2. 外部テクスチャPNGがあればGLBバイナリバッファに正しく埋め込み、
+       Gradio等の単一ファイルビューワーでもテクスチャが表示されるようにする。
     """
     try:
-        from pygltflib import GLTF2
+        from pygltflib import GLTF2, BufferView
     except ImportError:
         return False, "pygltflib がインストールされていません。pip install pygltflib を実行してください。"
 
     try:
         gltf = GLTF2().load(glb_path)
-        # X軸-90度のクォータニオン: [sin(-45°), 0, 0, cos(-45°)]
+
+        # --- 回転修正 ---
         angle = math.radians(-90)
         qx = math.sin(angle / 2)
         qw = math.cos(angle / 2)
@@ -92,21 +93,56 @@ def rotate_and_embed_glb(glb_path):
             node = gltf.nodes[node_idx]
             node.rotation = rotation
 
-        import base64
+        # --- テクスチャ埋め込み (手動バッファ操作) ---
         glb_dir = os.path.dirname(glb_path)
-        for image in gltf.images:
+        embedded_count = 0
+
+        for image in (gltf.images or []):
             if image.uri and not image.uri.startswith("data:"):
                 img_path = os.path.join(glb_dir, image.uri)
                 if os.path.exists(img_path):
                     with open(img_path, "rb") as f:
                         img_data = f.read()
-                    b64_data = base64.b64encode(img_data).decode('utf-8')
+
+                    # バイナリブロブ(blob_data)にテクスチャバイトを追加
+                    blob = gltf.binary_blob()
+                    if blob is None:
+                        blob = b""
+                    offset = len(blob)
+                    blob += img_data
+
+                    # バッファサイズを更新
+                    if len(gltf.buffers) == 0:
+                        from pygltflib import Buffer
+                        gltf.buffers.append(Buffer(byteLength=len(blob)))
+                    else:
+                        gltf.buffers[0].byteLength = len(blob)
+
+                    # 新しい bufferView を作成
+                    bv_index = len(gltf.bufferViews)
+                    gltf.bufferViews.append(BufferView(
+                        buffer=0,
+                        byteOffset=offset,
+                        byteLength=len(img_data),
+                    ))
+
+                    # image を bufferView 参照に切り替え
                     ext = os.path.splitext(image.uri)[1].lower()
-                    mime_type = "image/jpeg" if ext in ['.jpg', '.jpeg'] else "image/png"
-                    image.uri = f"data:{mime_type};base64,{b64_data}"
+                    image.mimeType = "image/jpeg" if ext in ['.jpg', '.jpeg'] else "image/png"
+                    image.bufferView = bv_index
+                    image.uri = None  # 外部参照を削除
+
+                    # バイナリブロブを書き戻し
+                    gltf.set_binary_blob(blob)
+                    embedded_count += 1
+
+        if embedded_count > 0:
+            tex_msg = f"回転修正＋テクスチャ{embedded_count}枚埋め込み完了"
+        else:
+            tex_msg = "回転修正完了"
 
         gltf.save(glb_path)
-        return True, "回転・テクスチャ埋め込み修正完了"
+        return True, tex_msg
     except Exception as e:
         return False, f"GLB修正エラー: {str(e)}"
 
@@ -156,12 +192,186 @@ def upload_to_playcanvas(glb_path, model_name):
     return True, f"アセットID:{asset_id}（シーン配置は手動で確認）"
 
 
+def parse_fastgs_log(log_path):
+    """FastGSのログを解析してステップ・進捗・ログを返す"""
+    if not os.path.exists(log_path):
+        return None
+
+    with open(log_path, 'r', encoding='utf-8', errors='ignore') as f:
+        content = f.read()
+        lines = content.splitlines()
+
+    # ステップ定義
+    steps = [
+        {"id": 1, "marker": "[1/4]", "label": "画像コピー"},
+        {"id": 2, "marker": "[2/4]", "label": "COLMAP カメラポーズ推定 (SfM)"},
+        {"id": 3, "marker": "[3/4]", "label": "FastGS 高速学習"},
+        {"id": 4, "marker": "[4/4]", "label": "出力ファイル確認"},
+    ]
+
+    # 現在のステップを特定
+    current_step = 0
+    for step in steps:
+        if step["marker"] in content:
+            current_step = step["id"]
+
+    # 完了判定
+    is_complete = "=== 完了!" in content
+    is_error = "ERROR:" in content
+
+    # FastGS 学習イテレーション解析 (train.pyの出力パターン)
+    iteration = 0
+    max_iteration = 30000
+    iter_matches = re.findall(r'(?:ITER|iteration)\s*[\[:]?\s*(\d+)', content, re.IGNORECASE)
+    if iter_matches:
+        iteration = int(iter_matches[-1])
+
+    # 全体進捗率の計算
+    if is_complete:
+        progress_pct = 100
+    elif is_error:
+        progress_pct = -1
+    elif current_step <= 1:
+        progress_pct = 5
+    elif current_step == 2:
+        progress_pct = 15
+    elif current_step == 3:
+        # 学習中: 20%〜90% をイテレーションで按分
+        progress_pct = 20 + int(70 * iteration / max_iteration)
+    elif current_step == 4:
+        progress_pct = 95
+    else:
+        progress_pct = 0
+
+    # 最新ログ行（空行除外）
+    recent = [l for l in lines if l.strip()][-12:]
+
+    return {
+        "current_step": current_step,
+        "steps": steps,
+        "progress_pct": min(progress_pct, 100),
+        "iteration": iteration,
+        "max_iteration": max_iteration,
+        "is_complete": is_complete,
+        "is_error": is_error,
+        "recent_log": recent,
+        "total_lines": len(lines),
+    }
+
+
+def format_progress_bar(pct, width=30):
+    """テキストベースのプログレスバーを生成"""
+    if pct < 0:
+        return f"{'━' * width}  ❌ ERROR"
+    filled = int(width * pct / 100)
+    empty = width - filled
+    bar = "█" * filled + "░" * empty
+    return f"{bar}  {pct}%"
+
+
+def check_fastgs_status(project_name):
+    """FastGSのログや出力PLYを確認する（プログレスバー付き）"""
+    safe_name = safe_filename(project_name.strip() if project_name.strip() else "model")
+    ply_path = os.path.join(OUTPUT_DIR, f"{safe_name}_3dgs.ply")
+    log_path = os.path.join(OUTPUT_DIR, f"{safe_name}_fastgs.log")
+
+    # 完了済み PLY チェック
+    if os.path.exists(ply_path):
+        size = os.path.getsize(ply_path) / (1024 * 1024)
+        bar = format_progress_bar(100)
+        status = (
+            f"{bar}\n\n"
+            f"✅ 学習完了！\n"
+            f"出力: {os.path.basename(ply_path)} ({size:.1f} MB)\n"
+            f"下の SuperSplat ビューワーにドラッグ＆ドロップして確認してください。"
+        )
+        return status, ply_path
+
+    # ログ解析
+    parsed = parse_fastgs_log(log_path)
+    if parsed is None:
+        return "⏸ 学習待機中、または実行されていません。", None
+
+    info = parsed
+    bar = format_progress_bar(info["progress_pct"])
+
+    # ステップ表示を組み立て
+    step_lines = []
+    for s in info["steps"]:
+        sid = s["id"]
+        if info["is_error"] and sid == info["current_step"]:
+            icon = "❌"
+            suffix = ""
+        elif sid < info["current_step"]:
+            icon = "✅"
+            suffix = ""
+        elif sid == info["current_step"]:
+            icon = "🔄"
+            if sid == 3 and info["iteration"] > 0:
+                suffix = f'  (iteration {info["iteration"]:,} / {info["max_iteration"]:,})'
+            else:
+                suffix = "  ..."
+        else:
+            icon = "⬜"
+            suffix = ""
+        step_lines.append(f"  {icon} [{sid}/4] {s['label']}{suffix}")
+
+    steps_block = "\n".join(step_lines)
+
+    # 最新ログ（末尾）
+    log_block = "\n".join(info["recent_log"])
+
+    if info["is_error"]:
+        header = "❌ エラーが発生しました"
+    elif info["is_complete"]:
+        header = "✅ 処理完了"
+    else:
+        header = "⏳ 学習実行中..."
+
+    status = (
+        f"{bar}\n"
+        f"{header}\n\n"
+        f"📋 ステップ:\n{steps_block}\n\n"
+        f"{'─' * 40}\n"
+        f"📝 ログ (最新):\n{log_block}"
+    )
+    return status, None
+
+
+import threading
+def run_fastgs_backend(project_name):
+    """DockerでFastGS学習をバックグラウンド実行"""
+    safe_name = safe_filename(project_name)
+    log_path = os.path.join(OUTPUT_DIR, f"{safe_name}_fastgs.log")
+    
+    cmd = [
+        "docker-compose", "run", "--rm", 
+        "fastgs", "/workspace/scripts/run_speedysplat.sh", safe_name
+    ]
+    
+    with open(log_path, 'w', encoding='utf-8') as f:
+        f.write(f"=== Starting 3DGS Training for {safe_name} ===\n")
+        f.flush()
+        process = subprocess.Popen(
+            cmd, 
+            stdout=subprocess.PIPE, 
+            stderr=subprocess.STDOUT,
+            cwd=os.path.dirname(os.path.abspath(__file__))
+        )
+        for line in iter(process.stdout.readline, b''):
+            decoded_line = line.decode('utf-8', errors='ignore')
+            f.write(decoded_line)
+            f.flush()
+        process.wait()
+
+
 # ===== メイン処理 =====
 
 def convert_to_3d(files, project_name, quality,
                   simplify_enabled, simplify_count,
                   smooth_enabled, texture_max_count,
                   sampling_fps, ai_masking_enabled, wide_area_enabled,
+                  run_3dgs_enabled,
                   progress=gr.Progress()):
     """3Dモデル変換（ジェネレーター：進捗をyield）
 
@@ -227,7 +437,7 @@ def convert_to_3d(files, project_name, quality,
     # CLIコマンド構築
     quality_flag = QUALITY_OPTIONS.get(quality, "-calculateNormalModel")
     glb_output_path = os.path.join(OUTPUT_DIR, f"{safe_name}.glb")
-    ply_output_path = os.path.join(OUTPUT_DIR, f"{safe_name}_sparse.ply")
+    sparse_ply_output_path = os.path.join(OUTPUT_DIR, f"{safe_name}_realityscan_sparse.ply")
 
     cmd = [
         REALITYSCAN_PATH,
@@ -267,8 +477,8 @@ def convert_to_3d(files, project_name, quality,
     # GLB 出力
     cmd += ["-exportModel", "output_model", glb_output_path]
 
-    # PLY（Sparse Point Cloud）出力
-    cmd += ["-exportSparsePointCloud", ply_output_path]
+    # RealityScan からの Sparse Point Cloud 出力 (学習前データ)
+    cmd += ["-exportSparsePointCloud", sparse_ply_output_path]
 
     cmd.append("-quit")
 
@@ -290,19 +500,19 @@ def convert_to_3d(files, project_name, quality,
             yield f"出力ファイルが見つかりません\n\n{stderr_text}"
             return
 
-        # ステップ3: GLB X軸-90度回転修正 & テクスチャ埋め込み (90-95%)
+        # ステップ3: GLB 回転修正＋テクスチャ埋め込み (90-95%)
         progress(0.92, desc="GLB修正中...")
-        yield "[3/3] GLB ファイルの回転修正・テクスチャ埋め込み中..."
-        rot_success, rot_msg = rotate_and_embed_glb(expected)
+        yield "[3/3] GLB ファイルの回転修正・テクスチャ統合中..."
+        rot_success, rot_msg = rotate_and_pack_glb(expected)
         if not rot_success:
-            yield f"⚠ 回転修正スキップ: {rot_msg}"
+            yield f"⚠ GLB修正スキップ: {rot_msg}"
 
         # PLY 出力確認
-        ply_exists = os.path.exists(ply_output_path)
+        ply_exists = os.path.exists(sparse_ply_output_path)
         if not ply_exists:
             actual_ply = find_new_file(OUTPUT_DIR, "ply", before_time)
-            if actual_ply and actual_ply != ply_output_path:
-                shutil.move(actual_ply, ply_output_path)
+            if actual_ply and actual_ply != sparse_ply_output_path:
+                shutil.move(actual_ply, sparse_ply_output_path)
                 ply_exists = True
 
         glb_size = os.path.getsize(expected) / (1024 * 1024)
@@ -317,10 +527,17 @@ def convert_to_3d(files, project_name, quality,
         if rot_success:
             result_lines.append("  → X軸 -90度回転修正済み")
         if ply_exists:
-            ply_size = os.path.getsize(ply_output_path) / (1024 * 1024)
-            result_lines.append(f"PLY: {ply_output_path} ({ply_size:.1f} MB)")
+            ply_size = os.path.getsize(sparse_ply_output_path) / (1024 * 1024)
+            result_lines.append(f"RealityScan PLY: {sparse_ply_output_path} ({ply_size:.1f} MB)")
         else:
-            result_lines.append("PLY: Sparse Point Cloud の出力は確認できませんでした")
+            result_lines.append("RealityScan PLY: の出力は確認できませんでした")
+            
+        if run_3dgs_enabled:
+            result_lines.append("")
+            result_lines.append("🔥 RealityScanが完了しました。続いて 3DGS (FastGS) のバックグラウンド学習を開始しました。")
+            result_lines.append("   学習状況は「3DGS / PLY ビューワー」タブから確認できます。")
+            threading.Thread(target=run_fastgs_backend, args=(safe_name,), daemon=True).start()
+            
         result_lines.append("")
         result_lines.append("ビューワーで確認後、送信先を選んでください")
 
@@ -350,13 +567,20 @@ def upload_to_targets(glb_path, project_name, send_unity, send_playcanvas):
 
     if send_unity:
         if glb_path and os.path.exists(glb_path):
-            unity_dir = os.path.join(UNITY_ASSETS_DIR, project_name)
-            os.makedirs(unity_dir, exist_ok=True)
-            dst = os.path.join(unity_dir, f"{project_name}.glb")
-            shutil.copy(glb_path, dst)
-            results.append(f"Unity: {dst}")
+            project_dir = os.path.join(UNITY_ASSETS_DIR, project_name)
+            os.makedirs(project_dir, exist_ok=True)
+            # GLBコピー
+            shutil.copy2(glb_path, os.path.join(project_dir, os.path.basename(glb_path)))
+            # 付随するテクスチャファイル群もコピー
+            base_name = os.path.splitext(os.path.basename(glb_path))[0]
+            output_dir = os.path.dirname(glb_path)
+            for f in os.listdir(output_dir):
+                if f.startswith(base_name) and f.endswith(('.png', '.jpg', '.jpeg')):
+                    shutil.copy2(os.path.join(output_dir, f), os.path.join(project_dir, f))
+            
+            results.append(f"Unity: {os.path.join(project_dir, os.path.basename(glb_path))} および関連テクスチャをコピーしました")
         else:
-            results.append("Unity: GLBファイルがありません")
+            results.append("Unity: GLBファイルが見つかりません")
 
     if send_playcanvas:
         if glb_path and os.path.exists(glb_path):
@@ -377,7 +601,7 @@ def upload_to_targets(glb_path, project_name, send_unity, send_playcanvas):
 # ===== WebUI =====
 
 with gr.Blocks(
-    title="RealityScan WebUI",
+    title="RealityScan/FastGS WebUI",
     theme=gr.themes.Soft(primary_hue="orange")
 ) as app:
 
@@ -407,14 +631,18 @@ with gr.Blocks(
             scale=1
         )
 
-    # --- RealityScan 2.0 新機能 ---
+    # --- RealityScan 2.0 新機能 & FastGS ---
     with gr.Row():
+        run_3dgs_enabled = gr.Checkbox(
+            label="🔥 FastGS (3DGS) 同時学習を実行する (Docker環境必須)",
+            value=True, scale=2
+        )
         ai_masking_enabled = gr.Checkbox(
             label="🎭 AIマスキング（空・動体の自動除外）",
             value=False, scale=1
         )
         wide_area_enabled = gr.Checkbox(
-            label="🌐 広域モード（コンポーネント結合＋品質レポート＋穴埋め）",
+            label="🌐 広域モード（コンポーネント結合）",
             value=False, scale=1
         )
 
@@ -440,13 +668,42 @@ with gr.Blocks(
                 scale=2
             )
 
-    convert_btn = gr.Button("3Dモデルに変換", variant="primary", size="lg")
+    convert_btn = gr.Button("3Dモデル・3DGS変換を開始", variant="primary", size="lg")
     status_output = gr.Textbox(label="処理状況", lines=6)
 
     # ========== セクション2: プレビュー ==========
     gr.Markdown("---")
-    gr.Markdown("### プレビュー")
-    glb_viewer = gr.Model3D(label="GLB ビューワー", height=480)
+    
+    with gr.Tabs():
+        with gr.Tab("GLB (ポリゴンメッシュ)"):
+            gr.Markdown("RealityScan で生成されたテクスチャ付きポリゴンメッシュです。")
+            glb_viewer = gr.Model3D(label="GLB ビューワー", height=480)
+            
+        with gr.Tab("3DGS / PLY ビューワー (FastGS)"):
+            gr.Markdown("Docker で学習を実行中の 3DGS モデル（Splat形式PLY）の状態確認とプレビューを行います。")
+
+            with gr.Row():
+                check_status_btn = gr.Button("🔄 手動で更新", variant="secondary", scale=1)
+                auto_refresh_enabled = gr.Checkbox(
+                    label="⏱ 自動更新 (5秒間隔)",
+                    value=False, scale=1
+                )
+
+            gs_status = gr.Textbox(
+                label="3DGS (FastGS) 学習ステータス",
+                lines=16,
+                max_lines=20,
+            )
+            gs_ply_file = gr.File(label="学習済 Splat PLY", interactive=False)
+
+            # 自動更新タイマー
+            gs_timer = gr.Timer(value=5, active=False)
+
+            gr.Markdown("### SuperSplat ビューワー")
+            gr.Markdown("✅ 学習が完了し PLY ファイルが出力されたら、上のファイルを手元にダウンロードし、下のビューワーに **ドラッグ＆ドロップ** して閲覧してください。")
+            gr.HTML("""
+            <iframe src="https://superspl.at/editor" width="100%" height="600px" style="border: 1px solid #ccc; border-radius: 8px;"></iframe>
+            """)
 
     # ========== セクション3: 送信先 ==========
     gr.Markdown("---")
@@ -466,13 +723,34 @@ with gr.Blocks(
             file_input, project_name_input, quality_input,
             simplify_enabled, simplify_count,
             smooth_enabled, texture_max_count,
-            sampling_fps, ai_masking_enabled, wide_area_enabled
+            sampling_fps, ai_masking_enabled, wide_area_enabled,
+            run_3dgs_enabled
         ],
         outputs=[status_output]
     ).then(
         fn=load_viewer,
         inputs=[project_name_input],
         outputs=[glb_viewer, glb_state]
+    )
+
+    check_status_btn.click(
+        fn=check_fastgs_status,
+        inputs=[project_name_input],
+        outputs=[gs_status, gs_ply_file]
+    )
+
+    # 自動更新チェックボックス → タイマーON/OFF
+    auto_refresh_enabled.change(
+        fn=lambda enabled: gr.Timer(active=enabled),
+        inputs=[auto_refresh_enabled],
+        outputs=[gs_timer]
+    )
+
+    # タイマーによる自動ステータス更新
+    gs_timer.tick(
+        fn=check_fastgs_status,
+        inputs=[project_name_input],
+        outputs=[gs_status, gs_ply_file]
     )
 
     upload_btn.click(

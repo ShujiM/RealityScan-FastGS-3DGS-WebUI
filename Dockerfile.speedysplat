@@ -1,39 +1,45 @@
-FROM nvidia/cuda:11.8.0-cudnn8-devel-ubuntu22.04
+FROM nvidia/cuda:11.6.2-cudnn8-devel-ubuntu20.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PATH="/usr/local/cuda/bin:${PATH}"
 ENV LD_LIBRARY_PATH="/usr/local/cuda/lib64:${LD_LIBRARY_PATH}"
+ENV CUDA_HOME="/usr/local/cuda"
+ENV TORCH_CUDA_ARCH_LIST="7.0;7.5;8.0;8.6+PTX"
+ENV MAX_JOBS=4
 
-# 基本ツールのインストールとCOLMAPの導入
+# 基本ツール + COLMAP
 RUN apt-get update && apt-get install -y \
     git \
     wget \
     curl \
     unzip \
     build-essential \
+    cmake \
     ffmpeg \
     colmap \
-    python3.10 \
+    python3.8 \
     python3-pip \
-    python3.10-dev \
+    python3.8-dev \
     ninja-build \
     && rm -rf /var/lib/apt/lists/*
 
-RUN ln -s /usr/bin/python3.10 /usr/bin/python
+RUN ln -sf /usr/bin/python3.8 /usr/bin/python
 
-# Pythonライブラリのインストール
-RUN pip install --upgrade pip
-RUN pip install torch==2.1.2 torchvision==0.16.2 torchaudio==2.1.2 --index-url https://download.pytorch.org/whl/cu118
+# Python パッケージ
+RUN pip install --upgrade pip setuptools wheel
+RUN pip install torch==1.12.1+cu116 torchvision==0.13.1+cu116 torchaudio==0.12.1+cu116 \
+    --extra-index-url https://download.pytorch.org/whl/cu116
+RUN pip install plyfile tqdm pillow numpy websockets
 
 WORKDIR /workspace
 
-# SpeedySplat のクローン
-RUN git clone --recursive https://github.com/speedysplat/speedy-splat.git /workspace/speedy-splat
+# FastGS のクローン
+RUN git clone --recursive https://github.com/fastgs/FastGS.git /workspace/fastgs
 
-# 依存モジュールのインストール
-WORKDIR /workspace/speedy-splat
-RUN pip install -r requirements.txt
-RUN pip install -e submodules/depth-diff-gaussian-rasterization
-RUN pip install -e submodules/simple-knn
+# CUDA 拡張モジュールのビルド
+WORKDIR /workspace/fastgs
+RUN pip install submodules/diff-gaussian-rasterization_fastgs
+RUN pip install submodules/simple-knn
+RUN pip install submodules/fused-ssim
 
 WORKDIR /workspace

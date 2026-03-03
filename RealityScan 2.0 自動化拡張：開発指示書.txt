@@ -1,0 +1,37 @@
+RealityScan 2.0 自動化拡張：開発指示書
+1. プロジェクト概要
+プロジェクト名: RealityScan 2.0 WebUI - Pro Expansion
+目的: 動画（MP4）から「商店街」などの広域・空間を対象とした、高精細なテクスチャ付きポリゴンメッシュ（GLB）および点群（PLY）を自動生成する。
+ターゲット環境: Windows 10/11, NVIDIA RTX 4070 (12GB VRAM), RAM 64GB
+
+2. 実装済み機能（現状）
+GradioによるGUI（動画アップロード、モデル名指定、品質選択）。
+
+FFmpegによるフレーム抽出（固定2fps）。
+
+RealityScan 2.0 CLI を用いた基本的な位置合わせ・メッシュ生成・テクスチャ貼付・GLB出力。
+
+UnityおよびPlayCanvasへの自動エクスポート。
+
+3. 追加実装リクエスト（要件定義）
+① 動画サンプリングの最適化
+機能: 移動速度に応じた画像抽出。
+
+技術仕様: GUIに sampling_fps スライダー（0.5～10.0）を追加。FFmpegの引数 -vf fps={fps} に動的に反映させる。
+
+② RealityScan 2.0 新機能の統合（CLIフラグ）
+AIマスキング: -detectMarkers およびAIレイヤーによる「空・動体（人、車）」の自動除外プロセスの追加。
+
+コンポーネント自動マージ: 広域スキャンで発生しやすい「データの断片化」を防ぐため、-mergeComponents フラグを有効化。
+
+整合性チェック: -checkAndFixCheckIntegrity を挿入し、大規模処理時のクラッシュを防止。
+
+③ 広域スキャン用「Proモード」のロジック
+品質管理: メッシュ生成前に -calculateQualityReport を実行し、データ密度の低い場所をログに出力。
+
+穴埋め処理: 複雑な構造物に対応するため、-closeHoles コマンドをメッシュ生成後に実行。
+
+テクスチャ最適化: unwrapMaximalTexCount（枚数）だけでなく、広域用にテクスチャ解像度を管理するパラメータ（unwrapStyle等）の調整。
+
+④ 3DGS（点群）との親和性向上
+出力拡張: GLBだけでなく、3DGSの初期値として利用可能な -exportSparsePointCloud（.ply形式）の同時出力機能。

@@ -16,5 +16,8 @@ uploads/
 output/
 scripts/logs/
 
+# Claude Code
+.claude/
+
 # Optional: RealityScan project temp files
 *.rsInfo
