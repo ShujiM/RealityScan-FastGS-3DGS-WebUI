@@ -1,0 +1,22 @@
+services:
+  speedysplat:
+    build:
+      context: .
+      dockerfile: Dockerfile.speedysplat
+    container_name: speedysplat_trainer
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics
+    volumes:
+      - ./uploads:/workspace/uploads
+      - ./output:/workspace/output
+      - ./scripts:/workspace/scripts
+    command: ["/bin/bash", "/workspace/scripts/run_speedysplat.sh"]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
