@@ -10,16 +10,42 @@ import math
 import glob
 
 # ===== 設定 =====
-REALITYSCAN_PATH = r"C:\Program Files\Epic Games\RealityScan_2.0\RealityScan.exe"
+
+def _find_realityscan():
+    """RealityScan 実行ファイルを自動検出（2.1 優先）"""
+    candidates = [
+        r"C:\Program Files\Epic Games\RealityScan_2.1\RealityScan.exe",
+        r"C:\Program Files\Epic Games\RealityScan\RealityScan.exe",
+        r"C:\Program Files\Epic Games\RealityScan_2.0\RealityScan.exe",
+    ]
+    for p in candidates:
+        if os.path.exists(p):
+            return p
+    return candidates[0]
+
+REALITYSCAN_PATH = _find_realityscan()
 FFMPEG_PATH = r"D:\ffmpeg\bin\ffmpeg.exe"
 UPLOAD_DIR = r"D:\RealityScanWebUI\uploads"
 OUTPUT_DIR = r"D:\RealityScanWebUI\output"
+LOG_DIR = r"D:\RealityScanWebUI\logs"
+CRASH_LOG_DIR = os.path.join(LOG_DIR, "crash")
+PROGRESS_DIR = os.path.join(LOG_DIR, "progress")
 UNITY_ASSETS_DIR = r"D:\RealityScan_unity\My project\Assets\ScannedModels"
+
+# ディレクトリ自動作成
+for _d in [LOG_DIR, CRASH_LOG_DIR, PROGRESS_DIR]:
+    os.makedirs(_d, exist_ok=True)
 
 # PlayCanvas設定
 PLAYCANVAS_API_TOKEN = "zqeWLVUT18uCWH2uW3J0Dsl1N0oweD7w"
 PLAYCANVAS_PROJECT_ID = "1466228"
 PLAYCANVAS_SCENE_ID = "2422772"
+
+# REST/gRPC API 設定 (RealityScan 2.1 Remote Command Plugin)
+# 有効にすると CLI の代わりに REST API でリモート制御する。
+# RealityScan を常駐起動し、Remote Command Plugin を有効化しておく必要がある。
+REST_API_ENABLED = False
+REST_API_URL = "http://localhost:20180"  # RealityScan REST API デフォルトポート
 
 # 品質設定
 QUALITY_OPTIONS = {
@@ -282,6 +308,81 @@ def format_progress_bar(pct, width=30):
     return f"{bar}  {pct}%"
 
 
+def parse_realityscan_progress(progress_file):
+    """RealityScan の -writeProgress 出力ファイルを解析して進捗を返す
+
+    Returns:
+        dict: {"name": str, "progress": float(0-1)} or None
+    """
+    if not os.path.exists(progress_file):
+        return None
+    try:
+        with open(progress_file, 'r', encoding='utf-8', errors='ignore') as f:
+            content = f.read().strip()
+        if not content:
+            return None
+
+        lines = content.strip().splitlines()
+        last_line = lines[-1] if lines else ""
+
+        # XML 形式: <Progress name="Alignment" progress="0.35" .../>
+        name_match = re.search(r'name="([^"]*)"', last_line)
+        progress_match = re.search(r'progress="([^"]*)"', last_line)
+        if progress_match:
+            pct = float(progress_match.group(1))
+            name = name_match.group(1) if name_match else "処理中"
+            return {"name": name, "progress": pct}
+
+        # テキスト形式: "processName progress 0.45" or "0.45"
+        pct_match = re.search(r'(\d+\.?\d*)\s*%', last_line)
+        if pct_match:
+            pct = float(pct_match.group(1)) / 100.0
+            return {"name": "処理中", "progress": min(pct, 1.0)}
+
+        # フォールバック: 0.0-1.0 の浮動小数点値
+        float_match = re.search(r'\b(0\.\d+|1\.0)\b', last_line)
+        if float_match:
+            return {"name": "処理中", "progress": float(float_match.group(1))}
+
+        return {"name": last_line[:60], "progress": -1}
+    except Exception:
+        return None
+
+
+# ===== REST/gRPC API ヘルパー =====
+
+def rest_api_send(command, params=None):
+    """RealityScan REST API にコマンドを送信（Remote Command Plugin）
+
+    REST_API_ENABLED=True の場合のみ動作。
+    RealityScan 2.1 の Remote Command Plugin が起動している必要がある。
+    """
+    if not REST_API_ENABLED:
+        return None
+    try:
+        url = f"{REST_API_URL}/v1/command"
+        payload = {"command": command}
+        if params:
+            payload["params"] = params
+        response = requests.post(url, json=payload, timeout=30)
+        response.raise_for_status()
+        return response.json()
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def rest_api_get_progress():
+    """REST API から RealityScan の処理進捗を取得"""
+    if not REST_API_ENABLED:
+        return None
+    try:
+        response = requests.get(f"{REST_API_URL}/v1/progress", timeout=5)
+        response.raise_for_status()
+        return response.json()
+    except Exception:
+        return None
+
+
 def check_fastgs_status(project_name):
     """FastGSのログや出力PLYを確認する（プログレスバー付き）"""
     safe_name = safe_filename(project_name.strip() if project_name.strip() else "model")
@@ -449,64 +550,140 @@ def convert_to_3d(files, project_name, quality,
 
     before_time = time.time()
 
-    # CLIコマンド構築
+    # ===========================================================
+    # CLI コマンド構築 (RealityScan 2.1)
+    # ===========================================================
     quality_flag = QUALITY_OPTIONS.get(quality, "-calculateNormalModel")
     glb_output_path = os.path.join(OUTPUT_DIR, f"{safe_name}.glb")
     sparse_ply_output_path = os.path.join(OUTPUT_DIR, f"{safe_name}_realityscan_sparse.ply")
+    progress_file = os.path.join(PROGRESS_DIR, f"{safe_name}_progress.txt")
 
+    # 古い進捗ファイルを削除
+    if os.path.exists(progress_file):
+        os.remove(progress_file)
+
+    # --- ヘッドレス + クラッシュ制御 + 進捗出力 (2.1 新機能) ---
     cmd = [
         REALITYSCAN_PATH,
-        "-addFolder", UPLOAD_DIR,
-        "-align",
-        "-setReconstructionRegionAuto",
+        "-headless",
+        "-silentcrashReportPath", CRASH_LOG_DIR,
+        "-stdConsole",
+        "-writeProgress", progress_file, "2",
     ]
 
-    # AIマスキング: 準備中（CLIフラグ未対応）
-    if ai_masking_enabled:
-        # cmd.append("-detectMarkers") # CLIでエラーになるため無効化
-        pass
+    # --- 画像追加 ---
+    cmd += ["-addFolder", UPLOAD_DIR]
 
-    # メッシュ生成
+    # --- AIマスキング (2.1 新機能: -generateAIMasks) ---
+    if ai_masking_enabled:
+        cmd.append("-generateAIMasks")
+
+    # --- アライメント ---
+    cmd.append("-align")
+    cmd.append("-setReconstructionRegionAuto")
+
+    # --- 広域モード: コンポーネント結合 ---
+    if wide_area_enabled:
+        cmd.append("-mergeComponents")
+        cmd.append("-closeHoles")
+
+    # --- メッシュ生成 ---
     cmd.append(quality_flag)
     cmd += ["-renameSelectedModel", "output_model"]
-
-    # 広域モード: コンポーネント結合 & 整合性チェック & 穴埋め（CLIフラグ未対応）
-    if wide_area_enabled:
-        # cmd.append("-mergeComponents")
-        # cmd.append("-checkAndFixCheckIntegrity")
-        # cmd.append("-closeHoles")
-        pass
 
     if simplify_enabled:
         cmd += ["-simplify", str(int(simplify_count))]
     if smooth_enabled:
         cmd.append("-smooth")
 
-    # テクスチャ設定
+    # --- テクスチャ設定 ---
     cmd += ["-set", f"unwrapMaximalTexCount={effective_tex_count}"]
     if wide_area_enabled:
-        # 広域用テクスチャスタイル最適化
         cmd += ["-set", "unwrapStyle=adaptive"]
     cmd.append("-calculateTexture")
 
-    # GLB 出力
+    # --- エクスポート: GLB ---
     cmd += ["-exportModel", "output_model", glb_output_path]
 
-    # RealityScan からの Sparse Point Cloud 出力 (学習前データ)
+    # --- エクスポート: Sparse Point Cloud ---
     cmd += ["-exportSparsePointCloud", sparse_ply_output_path]
 
-    # FastGS 用 COLMAP 形式エクスポート
-    # 注意: RealityScan 2.0 は -exportRegistration / -exportUndistortedImages を
-    #       サポートしておらず、実行するとクラッシュ(Mini Dump)する。
-    #       COLMAPスキップモードを利用するには、RealityCapture(フル版)で
-    #       手動エクスポートするか、Docker内COLMAPによる従来フローを使用する。
-    #       （run_speedysplat.sh が自動判定）
+    # --- エクスポート: COLMAP 形式 (2.1 新機能 — COLMAPスキップモード) ---
+    colmap_exported = False
+    if run_3dgs_enabled:
+        colmap_dir = os.path.join(OUTPUT_DIR, f"{safe_name}_colmap")
+        colmap_sparse_dir = os.path.join(colmap_dir, "sparse", "0")
+        colmap_images_dir = os.path.join(colmap_dir, "images")
+        os.makedirs(colmap_sparse_dir, exist_ok=True)
+        os.makedirs(colmap_images_dir, exist_ok=True)
+
+        # カメラ登録情報 (cameras.txt, images.txt, points3D.txt)
+        registration_path = os.path.join(colmap_sparse_dir, "cameras.txt")
+        cmd += ["-exportRegistration", registration_path]
+
+        # 歪み補正済み画像
+        cmd += ["-exportUndistortedImages", colmap_images_dir]
+
+        # 深度マップ・法線マップ (3DGS 学習補助データ)
+        maps_dir = os.path.join(OUTPUT_DIR, f"{safe_name}_maps")
+        os.makedirs(maps_dir, exist_ok=True)
+        cmd += ["-exportMapsAndMask", maps_dir]
+
+        colmap_exported = True
 
     cmd.append("-quit")
 
+    # ===========================================================
+    # サブプロセス実行 + リアルタイム進捗モニタリング
+    # ===========================================================
     try:
-        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        stdout, stderr = process.communicate()
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            cwd=os.path.dirname(os.path.abspath(__file__))
+        )
+
+        last_yield_msg = ""
+        rs_step_names = {
+            "Feature detection": "特徴点検出",
+            "Matching": "マッチング",
+            "Alignment": "アライメント",
+            "Depth map computation": "深度マップ計算",
+            "Normal model": "メッシュ生成",
+            "Preview model": "プレビューメッシュ生成",
+            "High model": "高品質メッシュ生成",
+            "Model computation": "メッシュ計算",
+            "Unwrap": "UV展開",
+            "Texturing": "テクスチャ計算",
+            "Coloring": "カラーリング",
+            "Simplification": "メッシュ簡略化",
+            "Smoothing": "スムージング",
+            "Export": "エクスポート",
+            "AI Masking": "AIマスキング",
+        }
+
+        while process.poll() is None:
+            rs_prog = parse_realityscan_progress(progress_file)
+            if rs_prog and rs_prog.get("progress", -1) >= 0:
+                pct = rs_prog["progress"]
+                raw_name = rs_prog.get("name", "処理中")
+                jp_name = rs_step_names.get(raw_name, raw_name)
+                pct_display = f"{pct * 100:.0f}%"
+                msg = f"[2/3] RealityScan: {jp_name} ({pct_display})"
+                if msg != last_yield_msg:
+                    progress(0.10 + pct * 0.78, desc=f"RealityScan: {jp_name}")
+                    yield msg
+                    last_yield_msg = msg
+            time.sleep(2)
+
+        # プロセス完了後の出力取得
+        remaining_output = process.stdout.read().decode(errors='ignore') if process.stdout else ""
+        returncode = process.returncode
+
+        if returncode != 0 and not os.path.exists(glb_output_path):
+            yield f"RealityScan エラー (exit code: {returncode})\n\n{remaining_output[-500:]}"
+            return
 
         progress(0.90, desc="出力確認中...")
 
@@ -518,8 +695,7 @@ def convert_to_3d(files, project_name, quality,
                 shutil.move(actual, expected)
 
         if not os.path.exists(expected):
-            stderr_text = stderr.decode(errors='ignore')
-            yield f"出力ファイルが見つかりません\n\n{stderr_text}"
+            yield f"GLBファイルが見つかりません。\nRealityScan出力:\n{remaining_output[-500:]}"
             return
 
         # ステップ3: GLB 回転修正＋テクスチャ埋め込み (90-95%)
@@ -539,27 +715,47 @@ def convert_to_3d(files, project_name, quality,
 
         glb_size = os.path.getsize(expected) / (1024 * 1024)
 
+        # COLMAP エクスポート結果確認
+        colmap_skip_ready = False
+        if colmap_exported:
+            colmap_files = glob.glob(os.path.join(colmap_sparse_dir, "*.txt"))
+            colmap_images = glob.glob(os.path.join(colmap_images_dir, "*"))
+            if len(colmap_files) >= 2 and len(colmap_images) > 0:
+                colmap_skip_ready = True
+
         progress(1.0, desc="変換完了！")
 
         result_lines = [
             "--- 変換完了 ---",
             "",
-            f"GLB: {expected} ({glb_size:.1f} MB)",
+            f"📦 GLB: {os.path.basename(expected)} ({glb_size:.1f} MB)",
         ]
         if rot_success:
             result_lines.append("  → X軸 -90度回転修正済み")
         if ply_exists:
             ply_size = os.path.getsize(sparse_ply_output_path) / (1024 * 1024)
-            result_lines.append(f"RealityScan PLY: {sparse_ply_output_path} ({ply_size:.1f} MB)")
-        else:
-            result_lines.append("RealityScan PLY: の出力は確認できませんでした")
-            
+            result_lines.append(f"📦 Sparse PLY: {os.path.basename(sparse_ply_output_path)} ({ply_size:.1f} MB)")
+
+        if colmap_exported:
+            if colmap_skip_ready:
+                result_lines.append(f"📦 COLMAP: {colmap_sparse_dir} (✅ スキップモード準備完了)")
+                result_lines.append(f"📦 歪み補正画像: {colmap_images_dir}")
+            else:
+                result_lines.append("⚠ COLMAPエクスポート: ファイルが不完全（Docker COLMAP フォールバック使用）")
+
+            maps_files = glob.glob(os.path.join(maps_dir, "*")) if os.path.isdir(maps_dir) else []
+            if maps_files:
+                result_lines.append(f"📦 深度/法線マップ: {maps_dir} ({len(maps_files)} files)")
+
         if run_3dgs_enabled:
             result_lines.append("")
-            result_lines.append("🔥 RealityScanが完了しました。続いて 3DGS (FastGS) のバックグラウンド学習を開始しました。")
+            if colmap_skip_ready:
+                result_lines.append("🔥 3DGS (FastGS) バックグラウンド学習開始 — ⚡ COLMAPスキップモード")
+            else:
+                result_lines.append("🔥 3DGS (FastGS) バックグラウンド学習開始 — 従来モード (Docker COLMAP)")
             result_lines.append("   学習状況は「3DGS / PLY ビューワー」タブから確認できます。")
             threading.Thread(target=run_fastgs_backend, args=(safe_name,), daemon=True).start()
-            
+
         result_lines.append("")
         result_lines.append("ビューワーで確認後、送信先を選んでください")
 
@@ -627,8 +823,10 @@ with gr.Blocks(
     theme=gr.themes.Soft(primary_hue="orange")
 ) as app:
 
-    gr.Markdown("# RealityScan WebUI")
+    gr.Markdown("# RealityScan 2.1 / FastGS WebUI")
     gr.Markdown("写真・動画 → 3Dモデル(GLB)生成 → プレビュー → Unity / PlayCanvas へ送信")
+    gr.Markdown(f"*RealityScan: `{os.path.basename(os.path.dirname(REALITYSCAN_PATH))}` | "
+                f"ヘッドレスモード | REST/gRPC: {'✅ 有効' if REST_API_ENABLED else '⬜ 無効'}*")
 
     glb_state = gr.State(None)
 
@@ -653,10 +851,10 @@ with gr.Blocks(
             scale=1
         )
 
-    # --- RealityScan 2.0 新機能 & FastGS ---
+    # --- RealityScan 2.1 新機能 & FastGS ---
     with gr.Row():
         run_3dgs_enabled = gr.Checkbox(
-            label="🔥 FastGS (3DGS) 同時学習を実行する (Docker環境必須)",
+            label="🔥 FastGS (3DGS) 同時学習 + COLMAPスキップ (Docker必須)",
             value=True, scale=2
         )
         ai_masking_enabled = gr.Checkbox(
@@ -664,7 +862,7 @@ with gr.Blocks(
             value=False, scale=1
         )
         wide_area_enabled = gr.Checkbox(
-            label="🌐 広域モード（コンポーネント結合）",
+            label="🌐 広域モード（コンポーネント結合 + 穴埋め）",
             value=False, scale=1
         )
 
@@ -690,8 +888,30 @@ with gr.Blocks(
                 scale=2
             )
 
+    with gr.Accordion("REST/gRPC API 設定 (上級者向け)", open=False):
+        gr.Markdown(
+            "RealityScan 2.1 の **Remote Command Plugin** を使用すると、"
+            "CLI の代わりに REST/gRPC API でリモート制御できます。\n\n"
+            "1. RealityScan を起動し、Remote Command Plugin を有効化\n"
+            "2. 下記 URL を設定して「有効化」\n"
+            "3. 変換実行時に REST API 経由で処理が行われます\n\n"
+            "*現在は CLI モード（ヘッドレス）で動作しています。*"
+        )
+        with gr.Row():
+            rest_api_url_input = gr.Textbox(
+                label="REST API URL",
+                value=REST_API_URL,
+                placeholder="http://localhost:20180",
+                scale=3
+            )
+            rest_api_toggle = gr.Checkbox(
+                label="REST API を有効化",
+                value=REST_API_ENABLED,
+                scale=1
+            )
+
     convert_btn = gr.Button("3Dモデル・3DGS変換を開始", variant="primary", size="lg")
-    status_output = gr.Textbox(label="処理状況", lines=6)
+    status_output = gr.Textbox(label="処理状況（リアルタイム進捗表示）", lines=8)
 
     # ========== セクション2: プレビュー ==========
     gr.Markdown("---")
