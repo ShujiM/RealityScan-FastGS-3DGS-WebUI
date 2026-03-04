@@ -389,10 +389,12 @@ def convert_to_3d(files, project_name, quality,
 
         # ステップ3: GLB 回転修正＋テクスチャ埋め込み (90-95%)
         progress(0.92, desc="GLB修正中...")
-        yield "[3/3] GLB ファイルの回転修正・テクスチャ統合中..."
+        yield "[3/3] GLB ファイルの回転修正（X軸 -90°）・テクスチャ統合中..."
         rot_success, rot_msg = rotate_and_pack_glb(expected)
-        if not rot_success:
-            yield f"⚠ GLB修正スキップ: {rot_msg}"
+        if rot_success:
+            yield f"✅ GLB修正完了: {rot_msg}"
+        else:
+            yield f"⚠ GLB修正失敗（詳細↓）:\n{rot_msg}"
 
         # PLY 出力確認
         ply_exists = os.path.exists(sparse_ply_output_path)

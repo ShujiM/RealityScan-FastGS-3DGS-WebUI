@@ -83,82 +83,132 @@ def auto_adjust_texture_count(image_count: int, vram_gb: int = 12) -> int:
 # GLB 後処理（回転修正 + テクスチャ埋め込み）
 # ──────────────────────────────────────────────
 
+def _quat_multiply(q1: list, q2: list) -> list:
+    """クォータニオンの合成 (Hamilton product)  形式: [x, y, z, w]
+
+    q1 × q2 の順で適用される（q1 が後から掛かる「追加回転」）。
+    """
+    x1, y1, z1, w1 = q1
+    x2, y2, z2, w2 = q2
+    return [
+        w1*x2 + x1*w2 + y1*z2 - z1*y2,
+        w1*y2 - x1*z2 + y1*w2 + z1*x2,
+        w1*z2 + x1*y2 - y1*x2 + z1*w2,
+        w1*w2 - x1*x2 - y1*y2 - z1*z2,
+    ]
+
+
 def rotate_and_pack_glb(glb_path: str):
     """GLBファイルのX軸-90度回転＋外部テクスチャをバイナリバッファに統合
 
-    1. ビューワー/Blenderで真上から見た状態になる問題を修正する。
-    2. 外部テクスチャPNGがあればGLBバイナリバッファに正しく埋め込み、
-       Gradio等の単一ファイルビューワーでもテクスチャが表示されるようにする。
+    1. Blender / ビューワーで「真上から見た状態」になる問題を修正する。
+       X軸 -90° 回転を既存ノード回転と合成してシーンのルートノードに適用。
+    2. 外部テクスチャ PNG が同ディレクトリにあればバイナリバッファに埋め込む。
+       GLTF spec に準拠した 4-byte アライメントで追加する。
 
     Returns:
         (success: bool, message: str)
     """
+    import traceback
+
     try:
-        from pygltflib import GLTF2, BufferView
+        from pygltflib import GLTF2, BufferView, Buffer
     except ImportError:
-        return False, "pygltflib がインストールされていません。pip install pygltflib を実行してください。"
+        return False, (
+            "pygltflib がインストールされていません。\n"
+            "  pip install pygltflib  を実行してください。"
+        )
 
     try:
         gltf = GLTF2().load(glb_path)
 
-        # --- 回転修正 ---
+        # ── 1. X軸 -90° 回転クォータニオン ────────────────────────
+        # モデルが「真上から見た状態（寝た姿勢）」→ 「正立」に補正。
+        # -90°X: sin(-45°)=-0.7071, cos(-45°)=0.7071
         angle = math.radians(-90)
-        qx = math.sin(angle / 2)
-        qw = math.cos(angle / 2)
-        rotation = [qx, 0.0, 0.0, qw]
+        new_rot = [math.sin(angle / 2), 0.0, 0.0, math.cos(angle / 2)]
 
         scene = gltf.scenes[gltf.scene]
+        if not scene.nodes:
+            return False, "GLB にシーンノードが見つかりません"
+
         for node_idx in scene.nodes:
             node = gltf.nodes[node_idx]
-            node.rotation = rotation
+            # 既存の回転と合成（上書きではなく乗算）
+            existing = list(node.rotation) if node.rotation else [0.0, 0.0, 0.0, 1.0]
+            node.rotation = _quat_multiply(new_rot, existing)
 
-        # --- テクスチャ埋め込み (手動バッファ操作) ---
+        # ── 2. 外部テクスチャの埋め込み ────────────────────────────
         glb_dir = os.path.dirname(glb_path)
         embedded_count = 0
+        embed_errors = []
+
+        # 全画像を走査してバイナリブロブに追加（ループ終了後に一括 set_binary_blob）
+        blob = gltf.binary_blob() or b""
 
         for image in (gltf.images or []):
-            if image.uri and not image.uri.startswith("data:"):
-                img_path = os.path.join(glb_dir, image.uri)
-                if os.path.exists(img_path):
-                    with open(img_path, "rb") as f:
-                        img_data = f.read()
+            if not (image.uri and not image.uri.startswith("data:")):
+                continue
 
-                    blob = gltf.binary_blob()
-                    if blob is None:
-                        blob = b""
-                    offset = len(blob)
-                    blob += img_data
+            # ファイルを検索（大文字小文字を区別しないフォールバック付き）
+            img_path = os.path.join(glb_dir, image.uri)
+            if not os.path.exists(img_path):
+                # 大文字小文字が違う場合のフォールバック
+                uri_lower = os.path.basename(image.uri).lower()
+                for fname in os.listdir(glb_dir):
+                    if fname.lower() == uri_lower:
+                        img_path = os.path.join(glb_dir, fname)
+                        break
 
-                    if len(gltf.buffers) == 0:
-                        from pygltflib import Buffer
-                        gltf.buffers.append(Buffer(byteLength=len(blob)))
-                    else:
-                        gltf.buffers[0].byteLength = len(blob)
+            if not os.path.exists(img_path):
+                embed_errors.append(f"テクスチャ未発見: {image.uri}")
+                continue
 
-                    bv_index = len(gltf.bufferViews)
-                    gltf.bufferViews.append(BufferView(
-                        buffer=0,
-                        byteOffset=offset,
-                        byteLength=len(img_data),
-                    ))
+            with open(img_path, "rb") as f:
+                img_data = f.read()
 
-                    ext = os.path.splitext(image.uri)[1].lower()
-                    image.mimeType = "image/jpeg" if ext in ['.jpg', '.jpeg'] else "image/png"
-                    image.bufferView = bv_index
-                    image.uri = None
+            # GLTF spec: bufferView.byteOffset は 4 バイトアライメント必須
+            pad_len = (4 - len(blob) % 4) % 4
+            blob += b"\x00" * pad_len
+            offset = len(blob)
+            blob += img_data
 
-                    gltf.set_binary_blob(blob)
-                    embedded_count += 1
+            # BufferView を追加
+            bv_index = len(gltf.bufferViews)
+            gltf.bufferViews.append(BufferView(
+                buffer=0,
+                byteOffset=offset,
+                byteLength=len(img_data),
+            ))
 
+            # image を bufferView 参照に切り替え
+            ext = os.path.splitext(img_path)[1].lower()
+            image.mimeType = "image/jpeg" if ext in (".jpg", ".jpeg") else "image/png"
+            image.bufferView = bv_index
+            image.uri = None
+            embedded_count += 1
+
+        # バッファサイズ更新 & blob 書き戻し（ループ外で一括）
         if embedded_count > 0:
-            tex_msg = f"回転修正＋テクスチャ{embedded_count}枚埋め込み完了"
-        else:
-            tex_msg = "回転修正完了"
+            if not gltf.buffers:
+                gltf.buffers.append(Buffer(byteLength=len(blob)))
+            else:
+                gltf.buffers[0].byteLength = len(blob)
+            gltf.set_binary_blob(blob)
 
+        # ── 3. 保存 ─────────────────────────────────────────────────
         gltf.save(glb_path)
-        return True, tex_msg
-    except Exception as e:
-        return False, f"GLB修正エラー: {str(e)}"
+
+        # 結果メッセージ
+        parts = ["X軸 -90° 回転修正済み"]
+        if embedded_count > 0:
+            parts.append(f"テクスチャ {embedded_count} 枚埋め込み完了")
+        if embed_errors:
+            parts.append("⚠ " + " / ".join(embed_errors))
+        return True, " ＋ ".join(parts)
+
+    except Exception:
+        return False, f"GLB修正エラー:\n{traceback.format_exc()}"
 
 
 # ──────────────────────────────────────────────
