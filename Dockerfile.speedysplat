@@ -7,7 +7,7 @@ ENV CUDA_HOME="/usr/local/cuda"
 ENV TORCH_CUDA_ARCH_LIST="7.0;7.5;8.0;8.6+PTX"
 ENV MAX_JOBS=4
 
-# 基本ツール + COLMAP
+# 基本ツール + COLMAP ビルド依存
 RUN apt-get update && apt-get install -y \
     git \
     wget \
@@ -16,12 +16,39 @@ RUN apt-get update && apt-get install -y \
     build-essential \
     cmake \
     ffmpeg \
-    colmap \
     python3.8 \
     python3-pip \
     python3.8-dev \
     ninja-build \
+    libboost-program-options-dev \
+    libboost-filesystem-dev \
+    libboost-graph-dev \
+    libboost-system-dev \
+    libeigen3-dev \
+    libflann-dev \
+    libfreeimage-dev \
+    libmetis-dev \
+    libgoogle-glog-dev \
+    libgflags-dev \
+    libsqlite3-dev \
+    libglew-dev \
+    qtbase5-dev \
+    libcgal-dev \
+    libceres-dev \
     && rm -rf /var/lib/apt/lists/*
+
+# COLMAP をソースからビルド（CUDA有効・GUI/OpenGL無効＝ヘッドレス対応）
+RUN git clone https://github.com/colmap/colmap.git /tmp/colmap && \
+    cd /tmp/colmap && git checkout 3.9.1 && \
+    mkdir build && cd build && \
+    cmake .. -GNinja \
+    -DCMAKE_CUDA_ARCHITECTURES="70;75;80;86" \
+    -DCMAKE_INSTALL_PREFIX=/usr/local \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCUDA_ENABLED=ON \
+    -DGUI_ENABLED=OFF && \
+    ninja -j4 && ninja install && \
+    rm -rf /tmp/colmap
 
 RUN ln -sf /usr/bin/python3.8 /usr/bin/python
 
@@ -36,13 +63,16 @@ WORKDIR /workspace
 # FastGS のクローン
 RUN git clone --recursive https://github.com/fastgs/FastGS.git /workspace/fastgs
 
+# FastGS パッチ: カメラ数が10未満の場合に sampling_cameras() がクラッシュする問題を修正
+RUN sed -i 's/num_cams = 10/num_cams = min(10, len(my_viewpoint_stack))/' \
+    /workspace/fastgs/utils/fast_utils.py && \
+    sed -i '/num_cams = min/a\\    if num_cams == 0:\n        return []' \
+    /workspace/fastgs/utils/fast_utils.py
+
 # CUDA 拡張モジュールのビルド
 WORKDIR /workspace/fastgs
 RUN pip install submodules/diff-gaussian-rasterization_fastgs
 RUN pip install submodules/simple-knn
 RUN pip install submodules/fused-ssim
-
-# apt版COLMAP (3.6) は --Mapper.ba_global_function_tolerance を認識しないためパッチ
-RUN sed -i 's/--Mapper.ba_global_function_tolerance=0.000001//g' /workspace/fastgs/convert.py
 
 WORKDIR /workspace

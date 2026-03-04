@@ -54,6 +54,66 @@ QUALITY_OPTIONS = {
     "高品質（低速）": "-calculateHighModel",
 }
 
+# プロセス追跡（停止ボタン用）
+_active_process = None
+_stop_requested = False
+
+
+def stop_processing():
+    """実行中のRealityScan/FastGSプロセスをすべて停止する"""
+    global _active_process, _stop_requested
+    _stop_requested = True
+    results = []
+
+    # 1. 追跡中のサブプロセスを停止
+    if _active_process and _active_process.poll() is None:
+        try:
+            _active_process.terminate()
+            _active_process.wait(timeout=5)
+            results.append("サブプロセスを終了しました")
+        except Exception:
+            _active_process.kill()
+            results.append("サブプロセスを強制終了しました")
+
+    # 2. RealityScan プロセスを停止
+    try:
+        import psutil
+        for proc in psutil.process_iter(['name']):
+            if 'RealityScan' in (proc.info['name'] or ''):
+                proc.terminate()
+                results.append(f"RealityScan (PID:{proc.pid}) を終了しました")
+    except ImportError:
+        # psutil なしの場合は taskkill を使用
+        ret = subprocess.run(
+            ['taskkill', '/F', '/IM', 'RealityScan.exe'],
+            capture_output=True, text=True
+        )
+        if ret.returncode == 0:
+            results.append("RealityScan を終了しました")
+    except Exception as e:
+        results.append(f"RealityScan 終了エラー: {e}")
+
+    # 3. FastGS Docker コンテナを停止
+    try:
+        docker_ret = subprocess.run(
+            ['docker', 'ps', '-q', '--filter', 'ancestor=realityscanwebui-fastgs'],
+            capture_output=True, text=True, timeout=5
+        )
+        container_ids = docker_ret.stdout.strip().split()
+        for cid in container_ids:
+            if cid:
+                subprocess.run(['docker', 'stop', cid], capture_output=True, timeout=15)
+                results.append(f"Docker コンテナ {cid[:12]} を停止しました")
+    except Exception as e:
+        results.append(f"Docker 停止エラー: {e}")
+
+    _active_process = None
+    _stop_requested = False
+
+    if not results:
+        return "停止するプロセスはありませんでした"
+    return "⏹ 処理を停止しました\n\n" + "\n".join(results)
+
 
 # ===== ヘルパー関数 =====
 
@@ -637,48 +697,104 @@ def convert_to_3d(files, project_name, quality,
     # サブプロセス実行 + リアルタイム進捗モニタリング
     # ===========================================================
     try:
+        global _active_process, _stop_requested
+        _stop_requested = False
         process = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             cwd=os.path.dirname(os.path.abspath(__file__))
         )
+        _active_process = process
 
-        last_yield_msg = ""
-        rs_step_names = {
-            "Feature detection": "特徴点検出",
-            "Matching": "マッチング",
-            "Alignment": "アライメント",
-            "Depth map computation": "深度マップ計算",
-            "Normal model": "メッシュ生成",
-            "Preview model": "プレビューメッシュ生成",
-            "High model": "高品質メッシュ生成",
-            "Model computation": "メッシュ計算",
-            "Unwrap": "UV展開",
-            "Texturing": "テクスチャ計算",
-            "Coloring": "カラーリング",
-            "Simplification": "メッシュ簡略化",
-            "Smoothing": "スムージング",
-            "Export": "エクスポート",
-            "AI Masking": "AIマスキング",
-        }
+        # --- stdout を非同期で読み取るスレッド ---
+        import queue
+        stdout_lines = []
+        stdout_queue = queue.Queue()
+
+        def _read_stdout(pipe, q):
+            for line in iter(pipe.readline, b''):
+                decoded = line.decode('utf-8', errors='ignore').rstrip()
+                if decoded:
+                    q.put(decoded)
+            pipe.close()
+
+        reader_thread = threading.Thread(
+            target=_read_stdout, args=(process.stdout, stdout_queue), daemon=True
+        )
+        reader_thread.start()
+
+        last_yield_key = ""
+        last_log_count = 0
 
         while process.poll() is None:
+            # 停止要求チェック
+            if _stop_requested:
+                yield "⏹ 停止要求を受信しました..."
+                break
+            # stdout キューからログ行を取得
+            while not stdout_queue.empty():
+                try:
+                    stdout_lines.append(stdout_queue.get_nowait())
+                except queue.Empty:
+                    break
+
+            # 進捗情報の構築
+            elapsed = time.time() - start_time
+            elapsed_str = f"{int(elapsed // 60)}分{int(elapsed % 60):02d}秒"
+
             rs_prog = parse_realityscan_progress(progress_file)
             if rs_prog and rs_prog.get("progress", -1) >= 0:
                 pct = rs_prog["progress"]
                 raw_name = rs_prog.get("name", "処理中")
                 jp_name = rs_step_names.get(raw_name, raw_name)
-                pct_display = f"{pct * 100:.0f}%"
-                msg = f"[2/3] RealityScan: {jp_name} ({pct_display})"
-                if msg != last_yield_msg:
-                    progress(0.10 + pct * 0.78, desc=f"RealityScan: {jp_name}")
-                    yield msg
-                    last_yield_msg = msg
-            time.sleep(2)
+                pct_display = f"{pct * 100:.1f}%"
 
-        # プロセス完了後の出力取得
-        remaining_output = process.stdout.read().decode(errors='ignore') if process.stdout else ""
+                # プログレスバー
+                bar_width = 30
+                filled = int(bar_width * pct)
+                bar = "█" * filled + "░" * (bar_width - filled)
+
+                progress(0.10 + pct * 0.78, desc=f"RealityScan: {jp_name}")
+            else:
+                pct_display = "..."
+                jp_name = "初期化中"
+                bar = "░" * 30
+                pct = -1
+
+            # 最新のコンソールログ（末尾8行）
+            recent_logs = stdout_lines[-8:] if stdout_lines else ["(出力待機中...)"]
+            log_block = "\n".join(f"  {l}" for l in recent_logs)
+
+            # 状態変化の検出（経過時間以外の変化があった場合のみyield）
+            current_key = f"{pct_display}|{jp_name}|{len(stdout_lines)}"
+            should_yield = (current_key != last_yield_key) or (len(stdout_lines) > last_log_count)
+
+            if should_yield:
+                msg = (
+                    f"[2/3] RealityScan 実行中\n"
+                    f"\n"
+                    f"  {bar}  {pct_display}\n"
+                    f"  フェーズ: {jp_name}\n"
+                    f"  経過時間: {elapsed_str}\n"
+                    f"\n"
+                    f"─── コンソールログ ───\n"
+                    f"{log_block}"
+                )
+                yield msg
+                last_yield_key = current_key
+                last_log_count = len(stdout_lines)
+
+            time.sleep(3)
+
+        # プロセス完了後: スレッドから残りのログ行を回収
+        reader_thread.join(timeout=5)
+        while not stdout_queue.empty():
+            try:
+                stdout_lines.append(stdout_queue.get_nowait())
+            except queue.Empty:
+                break
+        remaining_output = "\n".join(stdout_lines[-50:])
         returncode = process.returncode
 
         if returncode != 0 and not os.path.exists(glb_output_path):
@@ -910,8 +1026,10 @@ with gr.Blocks(
                 scale=1
             )
 
-    convert_btn = gr.Button("3Dモデル・3DGS変換を開始", variant="primary", size="lg")
-    status_output = gr.Textbox(label="処理状況（リアルタイム進捗表示）", lines=8)
+    with gr.Row():
+        convert_btn = gr.Button("3Dモデル・3DGS変換を開始", variant="primary", size="lg", scale=4)
+        stop_btn = gr.Button("⏹ 停止", variant="stop", size="lg", scale=1)
+    status_output = gr.Textbox(label="処理状況（リアルタイム進捗表示）", lines=15)
 
     # ========== セクション2: プレビュー ==========
     gr.Markdown("---")
@@ -993,6 +1111,12 @@ with gr.Blocks(
         fn=check_fastgs_status,
         inputs=[project_name_input],
         outputs=[gs_status, gs_ply_file]
+    )
+
+    stop_btn.click(
+        fn=stop_processing,
+        inputs=[],
+        outputs=[status_output]
     )
 
     upload_btn.click(

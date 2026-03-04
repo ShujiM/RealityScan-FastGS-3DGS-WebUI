@@ -101,8 +101,8 @@ else
     echo "[2/4] COLMAP でカメラポーズ推定中（SfM）..."
     cd "${FASTGS_DIR}"
 
-    # apt版COLMAPはCUDAサポート無しのため --no_gpu を指定
-    python convert.py -s "${WORK_DIR}" --no_gpu
+    # CUDA対応COLMAPでGPU処理
+    python convert.py -s "${WORK_DIR}"
 
     # COLMAP出力の検証
     if [ ! -d "${WORK_DIR}/sparse/0" ]; then
