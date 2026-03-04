@@ -309,9 +309,6 @@ def convert_to_3d(files, project_name, quality,
         )
         reader_thread.start()
 
-        last_yield_key = ""
-        last_log_count = 0
-
         while process.poll() is None:
             # 停止要求チェック
             if _stop_requested:
@@ -325,7 +322,7 @@ def convert_to_3d(files, project_name, quality,
                 except queue.Empty:
                     break
 
-            # 進捗情報の構築（BUG FIX: start_time → before_time）
+            # 進捗情報の構築
             elapsed = time.time() - before_time
             elapsed_str = f"{int(elapsed // 60)}分{int(elapsed % 60):02d}秒"
 
@@ -333,45 +330,35 @@ def convert_to_3d(files, project_name, quality,
             if rs_prog and rs_prog.get("progress", -1) >= 0:
                 pct = rs_prog["progress"]
                 raw_name = rs_prog.get("name", "処理中")
-                # BUG FIX: rs_step_names → RS_STEP_NAMES (config.py から import)
                 jp_name = RS_STEP_NAMES.get(raw_name, raw_name)
                 pct_display = f"{pct * 100:.1f}%"
 
                 bar_width = 30
                 filled = int(bar_width * pct)
                 bar = "█" * filled + "░" * (bar_width - filled)
-
-                progress(0.10 + pct * 0.78, desc=f"RealityScan: {jp_name}")
             else:
                 pct_display = "..."
                 jp_name = "初期化中"
                 bar = "░" * 30
-                pct = -1
 
-            # 最新のコンソールログ（末尾8行）
-            recent_logs = stdout_lines[-8:] if stdout_lines else ["(出力待機中...)"]
+            # 最新のコンソールログ（末尾12行を常に表示）
+            recent_logs = stdout_lines[-12:] if stdout_lines else ["(出力待機中...)"]
             log_block = "\n".join(f"  {l}" for l in recent_logs)
 
-            # 状態変化の検出
-            current_key = f"{pct_display}|{jp_name}|{len(stdout_lines)}"
-            should_yield = (current_key != last_yield_key) or (len(stdout_lines) > last_log_count)
+            # --- 毎回 yield して常にテキストを更新 ---
+            msg = (
+                f"[2/3] RealityScan 実行中\n"
+                f"\n"
+                f"  {bar}  {pct_display}\n"
+                f"  フェーズ: {jp_name}\n"
+                f"  経過時間: {elapsed_str}  |  ログ行数: {len(stdout_lines)}\n"
+                f"\n"
+                f"─── コンソールログ (末尾) ───\n"
+                f"{log_block}"
+            )
+            yield msg
 
-            if should_yield:
-                msg = (
-                    f"[2/3] RealityScan 実行中\n"
-                    f"\n"
-                    f"  {bar}  {pct_display}\n"
-                    f"  フェーズ: {jp_name}\n"
-                    f"  経過時間: {elapsed_str}\n"
-                    f"\n"
-                    f"─── コンソールログ ───\n"
-                    f"{log_block}"
-                )
-                yield msg
-                last_yield_key = current_key
-                last_log_count = len(stdout_lines)
-
-            time.sleep(3)
+            time.sleep(2)
 
         # プロセス完了後: スレッドから残りのログ行を回収
         reader_thread.join(timeout=5)

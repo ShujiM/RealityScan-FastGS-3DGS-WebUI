@@ -118,7 +118,12 @@ with gr.Blocks(
     with gr.Row():
         convert_btn = gr.Button("3Dモデル・3DGS変換を開始", variant="primary", size="lg", scale=4)
         stop_btn = gr.Button("⏹ 停止", variant="stop", size="lg", scale=1)
-    status_output = gr.Textbox(label="処理状況（リアルタイム進捗表示）", lines=15)
+    status_output = gr.Textbox(
+        label="処理状況（リアルタイム進捗表示）",
+        lines=18,
+        max_lines=25,
+        show_copy_button=True,
+    )
 
     # ========== セクション2: プレビュー ==========
     gr.Markdown("---")
