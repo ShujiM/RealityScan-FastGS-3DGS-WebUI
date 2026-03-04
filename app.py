@@ -327,7 +327,7 @@ def check_fastgs_status(project_name):
         else:
             icon = "⬜"
             suffix = ""
-        step_lines.append(f"  {icon} [{sid}/4] {s['label']}{suffix}")
+        step_lines.append(f"  {icon} {s['marker']} {s['label']}{suffix}")
 
     steps_block = "\n".join(step_lines)
 
@@ -495,22 +495,12 @@ def convert_to_3d(files, project_name, quality,
     # RealityScan からの Sparse Point Cloud 出力 (学習前データ)
     cmd += ["-exportSparsePointCloud", sparse_ply_output_path]
 
-    # FastGS 用 COLMAP 形式エクスポート（COLMAPスキップモード）
-    if run_3dgs_enabled:
-        colmap_dir = os.path.join(OUTPUT_DIR, f"{safe_name}_colmap")
-        colmap_sparse_dir = os.path.join(colmap_dir, "sparse", "0")
-        colmap_images_dir = os.path.join(colmap_dir, "images")
-        os.makedirs(colmap_sparse_dir, exist_ok=True)
-        os.makedirs(colmap_images_dir, exist_ok=True)
-
-        # 歪み補正モデルを Brown3 に設定 (PINHOLE互換の出力)
-        cmd += ["-set", "sfmDistortionModel=Brown3"]
-
-        # COLMAP テキスト形式でカメラ・画像情報をエクスポート
-        cmd += ["-exportRegistration", os.path.join(colmap_sparse_dir, "registration")]
-
-        # 歪み補正済み画像をエクスポート
-        cmd += ["-exportUndistortedImages", colmap_images_dir]
+    # FastGS 用 COLMAP 形式エクスポート
+    # 注意: RealityScan 2.0 は -exportRegistration / -exportUndistortedImages を
+    #       サポートしておらず、実行するとクラッシュ(Mini Dump)する。
+    #       COLMAPスキップモードを利用するには、RealityCapture(フル版)で
+    #       手動エクスポートするか、Docker内COLMAPによる従来フローを使用する。
+    #       （run_speedysplat.sh が自動判定）
 
     cmd.append("-quit")
 
