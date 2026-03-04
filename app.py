@@ -566,7 +566,7 @@ def convert_to_3d(files, project_name, quality,
     cmd = [
         REALITYSCAN_PATH,
         "-headless",
-        "-silentcrashReportPath", CRASH_LOG_DIR,
+        "-silent", CRASH_LOG_DIR,
         "-stdConsole",
         "-writeProgress", progress_file, "2",
     ]
