@@ -201,13 +201,23 @@ def parse_fastgs_log(log_path):
         content = f.read()
         lines = content.splitlines()
 
-    # ステップ定義
-    steps = [
-        {"id": 1, "marker": "[1/4]", "label": "画像コピー"},
-        {"id": 2, "marker": "[2/4]", "label": "COLMAP カメラポーズ推定 (SfM)"},
-        {"id": 3, "marker": "[3/4]", "label": "FastGS 高速学習"},
-        {"id": 4, "marker": "[4/4]", "label": "出力ファイル確認"},
-    ]
+    # COLMAPスキップモード判定
+    is_skip_mode = "COLMAPスキップモード" in content
+
+    # ステップ定義（モードで分岐）
+    if is_skip_mode:
+        steps = [
+            {"id": 1, "marker": "[1/3]", "label": "RealityScan COLMAP データコピー"},
+            {"id": 2, "marker": "[2/3]", "label": "FastGS 高速学習"},
+            {"id": 3, "marker": "[3/3]", "label": "出力ファイル確認"},
+        ]
+    else:
+        steps = [
+            {"id": 1, "marker": "[1/4]", "label": "画像コピー"},
+            {"id": 2, "marker": "[2/4]", "label": "COLMAP カメラポーズ推定 (SfM)"},
+            {"id": 3, "marker": "[3/4]", "label": "FastGS 高速学習"},
+            {"id": 4, "marker": "[4/4]", "label": "出力ファイル確認"},
+        ]
 
     # 現在のステップを特定
     current_step = 0
@@ -227,18 +237,19 @@ def parse_fastgs_log(log_path):
         iteration = int(iter_matches[-1])
 
     # 全体進捗率の計算
+    total_steps = len(steps)
+    train_step = 2 if is_skip_mode else 3
+
     if is_complete:
         progress_pct = 100
     elif is_error:
         progress_pct = -1
-    elif current_step <= 1:
-        progress_pct = 5
-    elif current_step == 2:
-        progress_pct = 15
-    elif current_step == 3:
+    elif current_step < train_step:
+        progress_pct = int(15 * current_step / train_step)
+    elif current_step == train_step:
         # 学習中: 20%〜90% をイテレーションで按分
         progress_pct = 20 + int(70 * iteration / max_iteration)
-    elif current_step == 4:
+    elif current_step > train_step:
         progress_pct = 95
     else:
         progress_pct = 0
@@ -252,8 +263,10 @@ def parse_fastgs_log(log_path):
         "progress_pct": min(progress_pct, 100),
         "iteration": iteration,
         "max_iteration": max_iteration,
+        "train_step": train_step,
         "is_complete": is_complete,
         "is_error": is_error,
+        "is_skip_mode": is_skip_mode,
         "recent_log": recent,
         "total_lines": len(lines),
     }
@@ -307,7 +320,7 @@ def check_fastgs_status(project_name):
             suffix = ""
         elif sid == info["current_step"]:
             icon = "🔄"
-            if sid == 3 and info["iteration"] > 0:
+            if sid == info.get("train_step", 3) and info["iteration"] > 0:
                 suffix = f'  (iteration {info["iteration"]:,} / {info["max_iteration"]:,})'
             else:
                 suffix = "  ..."
@@ -325,6 +338,8 @@ def check_fastgs_status(project_name):
         header = "❌ エラーが発生しました"
     elif info["is_complete"]:
         header = "✅ 処理完了"
+    elif info["is_skip_mode"]:
+        header = "⚡ COLMAPスキップモード — 学習実行中..."
     else:
         header = "⏳ 学習実行中..."
 
@@ -479,6 +494,23 @@ def convert_to_3d(files, project_name, quality,
 
     # RealityScan からの Sparse Point Cloud 出力 (学習前データ)
     cmd += ["-exportSparsePointCloud", sparse_ply_output_path]
+
+    # FastGS 用 COLMAP 形式エクスポート（COLMAPスキップモード）
+    if run_3dgs_enabled:
+        colmap_dir = os.path.join(OUTPUT_DIR, f"{safe_name}_colmap")
+        colmap_sparse_dir = os.path.join(colmap_dir, "sparse", "0")
+        colmap_images_dir = os.path.join(colmap_dir, "images")
+        os.makedirs(colmap_sparse_dir, exist_ok=True)
+        os.makedirs(colmap_images_dir, exist_ok=True)
+
+        # 歪み補正モデルを Brown3 に設定 (PINHOLE互換の出力)
+        cmd += ["-set", "sfmDistortionModel=Brown3"]
+
+        # COLMAP テキスト形式でカメラ・画像情報をエクスポート
+        cmd += ["-exportRegistration", os.path.join(colmap_sparse_dir, "registration")]
+
+        # 歪み補正済み画像をエクスポート
+        cmd += ["-exportUndistortedImages", colmap_images_dir]
 
     cmd.append("-quit")
 

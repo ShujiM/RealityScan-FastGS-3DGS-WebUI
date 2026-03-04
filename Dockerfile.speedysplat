@@ -42,4 +42,7 @@ RUN pip install submodules/diff-gaussian-rasterization_fastgs
 RUN pip install submodules/simple-knn
 RUN pip install submodules/fused-ssim
 
+# apt版COLMAP (3.6) は --Mapper.ba_global_function_tolerance を認識しないためパッチ
+RUN sed -i 's/--Mapper.ba_global_function_tolerance=0.000001//g' /workspace/fastgs/convert.py
+
 WORKDIR /workspace
