@@ -101,22 +101,63 @@ else
     echo "[2/4] COLMAP でカメラポーズ推定中（SfM）..."
     cd "${FASTGS_DIR}"
 
-    # CUDA対応COLMAPでGPU処理
-    python convert.py -s "${WORK_DIR}"
+    # COLMAP を直接実行（convert.py は sequential_matcher 非対応のため）
+    # 動画フレーム用: sequential_matcher + 単一カメラモデル (OPENCV)
+    COLMAP_DB="${WORK_DIR}/distorted/database.db"
+    COLMAP_IMG="${WORK_DIR}/input"
+    COLMAP_SPARSE_DISTORTED="${WORK_DIR}/distorted/sparse"
+    mkdir -p "${WORK_DIR}/distorted"
+    mkdir -p "${COLMAP_SPARSE_DISTORTED}"
 
-    # COLMAP出力の検証
+    echo "  [2a] 特徴点抽出中..."
+    colmap feature_extractor \
+        --database_path "${COLMAP_DB}" \
+        --image_path "${COLMAP_IMG}" \
+        --ImageReader.single_camera 1 \
+        --ImageReader.camera_model OPENCV \
+        --SiftExtraction.use_gpu 1
+
+    echo "  [2b] シーケンシャルマッチング中..."
+    colmap sequential_matcher \
+        --database_path "${COLMAP_DB}" \
+        --SiftMatching.use_gpu 1
+
+    echo "  [2c] SfM マッピング中..."
+    colmap mapper \
+        --database_path "${COLMAP_DB}" \
+        --image_path "${COLMAP_IMG}" \
+        --output_path "${COLMAP_SPARSE_DISTORTED}"
+
+    echo "  [2d] 歪み補正中..."
+    colmap image_undistorter \
+        --image_path "${COLMAP_IMG}" \
+        --input_path "${COLMAP_SPARSE_DISTORTED}/0" \
+        --output_path "${WORK_DIR}" \
+        --output_type COLMAP
+
+    # COLMAP出力の検証 (image_undistorter は sparse/ に直接出力する場合がある)
+    # FastGS の train.py は sparse/0/ を期待するため、必要に応じてリネーム
     if [ ! -d "${WORK_DIR}/sparse/0" ]; then
-        echo "ERROR: COLMAP再構築に失敗しました。sparse/0 ディレクトリが生成されていません。"
-        echo "  考えられる原因:"
-        echo "  - 画像間のオーバーラップが不十分"
-        echo "  - 画像枚数が少なすぎる (推奨: 20枚以上)"
-        echo "  - 画像の品質が低い（ブレ、低解像度等）"
-        echo ""
-        echo "  作業ディレクトリの内容:"
-        ls -la "${WORK_DIR}/" 2>/dev/null
-        echo "  distorted/の内容:"
-        ls -la "${WORK_DIR}/distorted/" 2>/dev/null || echo "  (distorted/ なし)"
-        exit 1
+        # sparse/ に直接 .bin/.txt ファイルがある場合 → sparse/0/ に移動
+        if ls "${WORK_DIR}/sparse/"*.bin 1>/dev/null 2>&1 || ls "${WORK_DIR}/sparse/"*.txt 1>/dev/null 2>&1; then
+            echo "  sparse/ → sparse/0/ に構造変換中..."
+            mkdir -p "${WORK_DIR}/sparse/0_tmp"
+            mv "${WORK_DIR}/sparse/"*.bin "${WORK_DIR}/sparse/0_tmp/" 2>/dev/null || true
+            mv "${WORK_DIR}/sparse/"*.txt "${WORK_DIR}/sparse/0_tmp/" 2>/dev/null || true
+            mv "${WORK_DIR}/sparse/0_tmp" "${WORK_DIR}/sparse/0"
+        else
+            echo "ERROR: COLMAP再構築に失敗しました。sparse ディレクトリにデータがありません。"
+            echo "  考えられる原因:"
+            echo "  - 画像間のオーバーラップが不十分"
+            echo "  - 画像枚数が少なすぎる (推奨: 20枚以上)"
+            echo "  - 画像の品質が低い（ブレ、低解像度等）"
+            echo ""
+            echo "  作業ディレクトリの内容:"
+            ls -la "${WORK_DIR}/" 2>/dev/null
+            echo "  sparse/の内容:"
+            ls -la "${WORK_DIR}/sparse/" 2>/dev/null || echo "  (sparse/ なし)"
+            exit 1
+        fi
     fi
 
     SPARSE_FILES=$(ls -1 "${WORK_DIR}/sparse/0/" 2>/dev/null | wc -l)
@@ -147,6 +188,11 @@ fi
 
 if [ -n "${RESULT_PLY}" ] && [ -f "${RESULT_PLY}" ]; then
     cp "${RESULT_PLY}" "${OUTPUT_DIR}/${PROJECT_NAME}_3dgs.ply"
+
+    # X軸-90度回転（GLBと同じ座標系にする）
+    echo "  PLY X軸-90度回転中..."
+    python /workspace/scripts/rotate_ply.py "${OUTPUT_DIR}/${PROJECT_NAME}_3dgs.ply"
+
     PLY_SIZE=$(du -h "${OUTPUT_DIR}/${PROJECT_NAME}_3dgs.ply" | cut -f1)
     echo "=== 完了! 出力: ${OUTPUT_DIR}/${PROJECT_NAME}_3dgs.ply (${PLY_SIZE}) ==="
 else

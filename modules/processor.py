@@ -242,6 +242,9 @@ def convert_to_3d(files, project_name, quality,
     # --- メッシュ生成（生成後はモデルが自動選択される） ---
     cmd.append(quality_flag)
 
+    # --- 最大コンポーネント選択（メッシュ生成後 — 不要なポリゴンを除外） ---
+    cmd.append("-selectMaximalComponent")
+
     # --- 広域モード: 穴埋め（メッシュ操作 — メッシュ生成後に実行） ---
     if wide_area_enabled:
         cmd.append("-closeHoles")
@@ -301,7 +304,7 @@ def convert_to_3d(files, project_name, quality,
         while process.poll() is None:
             # 停止要求チェック
             if _stop_requested:
-                yield "⏹ 停止要求を受信しました..."
+                yield "停止要求を受信しました..."
                 break
 
             # stdout キューからログ行を取得
@@ -423,9 +426,9 @@ def convert_to_3d(files, project_name, quality,
         yield "[3/3] GLB ファイルの回転修正（X軸 -90°）・テクスチャ統合中..."
         rot_success, rot_msg = rotate_and_pack_glb(expected)
         if rot_success:
-            yield f"✅ GLB修正完了: {rot_msg}"
+            yield f"GLB修正完了: {rot_msg}"
         else:
-            yield f"⚠ GLB修正失敗（詳細↓）:\n{rot_msg}"
+            yield f"GLB修正失敗（詳細↓）:\n{rot_msg}"
 
         # PLY 出力確認
         ply_exists = os.path.exists(sparse_ply_output_path)
@@ -455,22 +458,22 @@ def convert_to_3d(files, project_name, quality,
         total_sec = int(total_elapsed % 60)
         result_lines = [
             "--- 変換完了 ---",
-            f"⏱ 変換時間: {total_min}分{total_sec:02d}秒",
+            f"変換時間: {total_min}分{total_sec:02d}秒",
             "",
-            f"📦 GLB: {os.path.basename(expected)} ({glb_size:.1f} MB)",
+            f"GLB: {os.path.basename(expected)} ({glb_size:.1f} MB)",
         ]
         if rot_success:
             result_lines.append("  → X軸 -90度回転修正済み")
         if ply_exists:
             ply_size = os.path.getsize(sparse_ply_output_path) / (1024 * 1024)
-            result_lines.append(f"📦 Sparse PLY: {os.path.basename(sparse_ply_output_path)} ({ply_size:.1f} MB)")
+            result_lines.append(f"Sparse PLY: {os.path.basename(sparse_ply_output_path)} ({ply_size:.1f} MB)")
 
         if run_3dgs_enabled:
             result_lines.append("")
             if colmap_skip_ready:
-                result_lines.append("🔥 3DGS (FastGS) バックグラウンド学習開始 — ⚡ COLMAPスキップモード")
+                result_lines.append("3DGS (FastGS) バックグラウンド学習開始 — COLMAPスキップモード")
             else:
-                result_lines.append("🔥 3DGS (FastGS) バックグラウンド学習開始 — Docker COLMAP + 学習")
+                result_lines.append("3DGS (FastGS) バックグラウンド学習開始 — Docker COLMAP + 学習")
             result_lines.append("   学習状況は「3DGS / PLY ビューワー」タブから確認できます。")
             threading.Thread(target=run_fastgs_backend, args=(safe_name,), daemon=True).start()
 

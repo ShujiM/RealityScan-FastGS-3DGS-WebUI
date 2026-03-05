@@ -112,7 +112,7 @@ def check_fastgs_status(project_name):
         bar = format_progress_bar(100)
         status = (
             f"{bar}\n\n"
-            f"✅ 学習完了！\n"
+            f"学習完了！\n"
             f"出力: {os.path.basename(ply_path)} ({size:.1f} MB)\n"
             f"下の SuperSplat ビューワーにドラッグ＆ドロップして確認してください。"
         )
@@ -121,7 +121,7 @@ def check_fastgs_status(project_name):
     # ログ解析
     parsed = parse_fastgs_log(log_path)
     if parsed is None:
-        return "⏸ 学習待機中、または実行されていません。", None
+        return "学習待機中、または実行されていません。", None
 
     info = parsed
     bar = format_progress_bar(info["progress_pct"])
@@ -131,19 +131,19 @@ def check_fastgs_status(project_name):
     for s in info["steps"]:
         sid = s["id"]
         if info["is_error"] and sid == info["current_step"]:
-            icon = "❌"
+            icon = "[X]"
             suffix = ""
         elif sid < info["current_step"]:
-            icon = "✅"
+            icon = "[v]"
             suffix = ""
         elif sid == info["current_step"]:
-            icon = "🔄"
+            icon = "[>]"
             if sid == info.get("train_step", 3) and info["iteration"] > 0:
                 suffix = f'  (iteration {info["iteration"]:,} / {info["max_iteration"]:,})'
             else:
                 suffix = "  ..."
         else:
-            icon = "⬜"
+            icon = "[ ]"
             suffix = ""
         step_lines.append(f"  {icon} {s['marker']} {s['label']}{suffix}")
 
@@ -151,20 +151,20 @@ def check_fastgs_status(project_name):
     log_block = "\n".join(info["recent_log"])
 
     if info["is_error"]:
-        header = "❌ エラーが発生しました"
+        header = "エラーが発生しました"
     elif info["is_complete"]:
-        header = "✅ 処理完了"
+        header = "処理完了"
     elif info["is_skip_mode"]:
-        header = "⚡ COLMAPスキップモード — 学習実行中..."
+        header = "COLMAPスキップモード — 学習実行中..."
     else:
-        header = "⏳ 学習実行中..."
+        header = "学習実行中..."
 
     status = (
         f"{bar}\n"
         f"{header}\n\n"
-        f"📋 ステップ:\n{steps_block}\n\n"
+        f"ステップ:\n{steps_block}\n\n"
         f"{'─' * 40}\n"
-        f"📝 ログ (最新):\n{log_block}"
+        f"ログ (最新):\n{log_block}"
     )
     return status, None
 

@@ -21,16 +21,30 @@ from modules.uploader import upload_to_targets
 # WebUI 定義
 # ──────────────────────────────────────────────
 
+CUSTOM_CSS = """
+@import url('https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@400;500;700&display=swap');
+* {
+    font-family: 'Noto Sans JP', sans-serif !important;
+}
+/* Gradioの不要なツールバーボタンを非表示 */
+.icon-button-wrapper,
+.icon_buttons,
+button.icon-button {
+    display: none !important;
+}
+"""
+
 with gr.Blocks(
     title="RealityScan/FastGS WebUI",
-    theme=gr.themes.Soft(primary_hue="orange")
+    theme=gr.themes.Soft(primary_hue="orange"),
+    css=CUSTOM_CSS
 ) as app:
 
     gr.Markdown("# RealityScan 2.1 / FastGS WebUI")
     gr.Markdown("写真・動画 → 3Dモデル(GLB)生成 → プレビュー → Unity / PlayCanvas へ送信")
     gr.Markdown(
         f"*RealityScan: `{os.path.basename(os.path.dirname(REALITYSCAN_PATH))}` | "
-        f"ヘッドレスモード | REST/gRPC: {'✅ 有効' if REST_API_ENABLED else '⬜ 無効'}*"
+        f"ヘッドレスモード | REST/gRPC: {'有効' if REST_API_ENABLED else '無効'}*"
     )
 
     glb_state = gr.State(None)
@@ -59,15 +73,15 @@ with gr.Blocks(
     # --- RealityScan 2.1 新機能 & FastGS ---
     with gr.Row():
         run_3dgs_enabled = gr.Checkbox(
-            label="🔥 FastGS (3DGS) 同時学習 + COLMAPスキップ (Docker必須)",
+            label="FastGS (3DGS) 同時学習 + COLMAPスキップ (Docker必須)",
             value=True, scale=2
         )
         ai_masking_enabled = gr.Checkbox(
-            label="🎭 AIマスキング（空・動体の自動除外）",
+            label="AIマスキング（空・動体の自動除外）",
             value=False, scale=1
         )
         wide_area_enabled = gr.Checkbox(
-            label="🌐 広域モード（コンポーネント結合 + 穴埋め）",
+            label="広域モード（コンポーネント結合 + 穴埋め）",
             value=False, scale=1
         )
 
@@ -117,7 +131,7 @@ with gr.Blocks(
 
     with gr.Row():
         convert_btn = gr.Button("3Dモデル・3DGS変換を開始", variant="primary", size="lg", scale=4)
-        stop_btn = gr.Button("⏹ 停止", variant="stop", size="lg", scale=1)
+        stop_btn = gr.Button("停止", variant="stop", size="lg", scale=1)
     status_output = gr.Textbox(
         label="処理状況（リアルタイム進捗表示）",
         lines=18,
@@ -139,10 +153,10 @@ with gr.Blocks(
             )
 
             with gr.Row():
-                check_status_btn = gr.Button("🔄 手動で更新", variant="secondary", scale=1)
+                check_status_btn = gr.Button("手動で更新", variant="secondary", scale=1)
                 auto_refresh_enabled = gr.Checkbox(
-                    label="⏱ 自動更新 (5秒間隔)",
-                    value=False, scale=1
+                    label="自動更新 (5秒間隔)",
+                    value=True, scale=1
                 )
 
             gs_status = gr.Textbox(
@@ -153,11 +167,11 @@ with gr.Blocks(
             gs_ply_file = gr.File(label="学習済 Splat PLY", interactive=False)
 
             # 自動更新タイマー
-            gs_timer = gr.Timer(value=5, active=False)
+            gs_timer = gr.Timer(value=5, active=True)
 
             gr.Markdown("### SuperSplat ビューワー")
             gr.Markdown(
-                "✅ 学習が完了し PLY ファイルが出力されたら、"
+                "学習が完了し PLY ファイルが出力されたら、"
                 "上のファイルを手元にダウンロードし、下のビューワーに "
                 "**ドラッグ＆ドロップ** して閲覧してください。"
             )
