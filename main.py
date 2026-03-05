@@ -122,7 +122,6 @@ with gr.Blocks(
         label="処理状況（リアルタイム進捗表示）",
         lines=18,
         max_lines=25,
-        show_copy_button=True,
     )
 
     # ========== セクション2: プレビュー ==========

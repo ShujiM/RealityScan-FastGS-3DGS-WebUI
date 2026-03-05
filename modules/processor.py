@@ -232,19 +232,27 @@ def convert_to_3d(files, project_name, quality,
     cmd.append("-align")
     cmd.append("-setReconstructionRegionAuto")
 
-    # --- 広域モード: コンポーネント結合 ---
+    # --- 広域モード: コンポーネント結合（アライメント操作 — メッシュ生成前に実行） ---
     if wide_area_enabled:
         cmd.append("-mergeComponents")
-        cmd.append("-closeHoles")
 
-    # --- メッシュ生成 ---
+    # --- 最大コンポーネント選択（メッシュ生成前に実行 — 複数コンポーネント時に必要） ---
+    cmd.append("-selectMaximalComponent")
+
+    # --- メッシュ生成（生成後はモデルが自動選択される） ---
     cmd.append(quality_flag)
-    cmd += ["-renameSelectedModel", "output_model"]
+
+    # --- 広域モード: 穴埋め（メッシュ操作 — メッシュ生成後に実行） ---
+    if wide_area_enabled:
+        cmd.append("-closeHoles")
 
     if simplify_enabled:
         cmd += ["-simplify", str(int(simplify_count))]
     if smooth_enabled:
         cmd.append("-smooth")
+
+    # --- 処理後のモデルを命名 ---
+    cmd += ["-renameSelectedModel", "output_model"]
 
     # --- テクスチャ設定 ---
     cmd += ["-set", f"unwrapMaximalTexCount={effective_tex_count}"]
@@ -257,25 +265,6 @@ def convert_to_3d(files, project_name, quality,
 
     # --- エクスポート: Sparse Point Cloud ---
     cmd += ["-exportSparsePointCloud", sparse_ply_output_path]
-
-    # --- エクスポート: COLMAP 形式 (2.1 新機能 — COLMAPスキップモード) ---
-    colmap_exported = False
-    if run_3dgs_enabled:
-        colmap_dir = os.path.join(OUTPUT_DIR, f"{safe_name}_colmap")
-        colmap_sparse_dir = os.path.join(colmap_dir, "sparse", "0")
-        colmap_images_dir = os.path.join(colmap_dir, "images")
-        os.makedirs(colmap_sparse_dir, exist_ok=True)
-        os.makedirs(colmap_images_dir, exist_ok=True)
-
-        registration_path = os.path.join(colmap_sparse_dir, "cameras.txt")
-        cmd += ["-exportRegistration", registration_path]
-        cmd += ["-exportUndistortedImages", colmap_images_dir]
-
-        maps_dir = os.path.join(OUTPUT_DIR, f"{safe_name}_maps")
-        os.makedirs(maps_dir, exist_ok=True)
-        cmd += ["-exportMapsAndMask", maps_dir]
-
-        colmap_exported = True
 
     cmd.append("-quit")
 
@@ -327,6 +316,44 @@ def convert_to_3d(files, project_name, quality,
             elapsed_str = f"{int(elapsed // 60)}分{int(elapsed % 60):02d}秒"
 
             rs_prog = parse_realityscan_progress(progress_file)
+
+            # --- stdoutログからフェーズを検出（-writeProgress が更新されない区間用） ---
+            stdout_phase = None
+            for line in reversed(stdout_lines[-30:]):
+                if "Executing command" in line:
+                    if "exportModel" in line:
+                        stdout_phase = "GLBエクスポート中"
+                    elif "exportSparsePointCloud" in line:
+                        stdout_phase = "スパース点群エクスポート中"
+                    elif "exportRegistration" in line:
+                        stdout_phase = "COLMAPカメラデータ エクスポート中"
+                    elif "exportUndistortedImages" in line:
+                        stdout_phase = "歪み補正画像エクスポート中（時間がかかります）"
+                    elif "exportMapsAndMask" in line:
+                        stdout_phase = "深度/法線マップ エクスポート中"
+                    elif "calculateTexture" in line:
+                        stdout_phase = "テクスチャ生成中"
+                    elif "closeHoles" in line:
+                        stdout_phase = "穴埋め処理中"
+                    elif "simplify" in line:
+                        stdout_phase = "メッシュ簡略化中"
+                    elif "smooth" in line:
+                        stdout_phase = "スムージング中"
+                    elif "selectMaximalComponent" in line:
+                        stdout_phase = "最大コンポーネント選択中"
+                    elif "mergeComponents" in line:
+                        stdout_phase = "コンポーネント結合中"
+                    break
+                elif "Texturing Model completed" in line:
+                    stdout_phase = "テクスチャ生成完了"
+                    break
+                elif "Exporting" in line and "completed" in line:
+                    stdout_phase = "エクスポート処理中"
+                    break
+                elif "Reconstruction in" in line and "completed" in line:
+                    stdout_phase = "メッシュ生成完了"
+                    break
+
             if rs_prog and rs_prog.get("progress", -1) >= 0:
                 pct = rs_prog["progress"]
                 raw_name = rs_prog.get("name", "処理中")
@@ -340,6 +367,10 @@ def convert_to_3d(files, project_name, quality,
                 pct_display = "..."
                 jp_name = "初期化中"
                 bar = "░" * 30
+
+            # stdoutから検出したフェーズがあればそちらを優先表示
+            if stdout_phase:
+                jp_name = stdout_phase
 
             # 最新のコンソールログ（末尾12行を常に表示）
             recent_logs = stdout_lines[-12:] if stdout_lines else ["(出力待機中...)"]
@@ -406,9 +437,12 @@ def convert_to_3d(files, project_name, quality,
 
         glb_size = os.path.getsize(expected) / (1024 * 1024)
 
-        # COLMAP エクスポート結果確認
+        # COLMAP エクスポート結果確認（既存データがある場合のスキップモード判定）
+        colmap_dir = os.path.join(OUTPUT_DIR, f"{safe_name}_colmap")
+        colmap_sparse_dir = os.path.join(colmap_dir, "sparse", "0")
+        colmap_images_dir = os.path.join(colmap_dir, "images")
         colmap_skip_ready = False
-        if colmap_exported:
+        if os.path.isdir(colmap_sparse_dir) and os.path.isdir(colmap_images_dir):
             colmap_files = glob.glob(os.path.join(colmap_sparse_dir, "*.txt"))
             colmap_images = glob.glob(os.path.join(colmap_images_dir, "*"))
             if len(colmap_files) >= 2 and len(colmap_images) > 0:
@@ -416,8 +450,12 @@ def convert_to_3d(files, project_name, quality,
 
         progress(1.0, desc="変換完了！")
 
+        total_elapsed = time.time() - before_time
+        total_min = int(total_elapsed // 60)
+        total_sec = int(total_elapsed % 60)
         result_lines = [
             "--- 変換完了 ---",
+            f"⏱ 変換時間: {total_min}分{total_sec:02d}秒",
             "",
             f"📦 GLB: {os.path.basename(expected)} ({glb_size:.1f} MB)",
         ]
@@ -427,23 +465,12 @@ def convert_to_3d(files, project_name, quality,
             ply_size = os.path.getsize(sparse_ply_output_path) / (1024 * 1024)
             result_lines.append(f"📦 Sparse PLY: {os.path.basename(sparse_ply_output_path)} ({ply_size:.1f} MB)")
 
-        if colmap_exported:
-            if colmap_skip_ready:
-                result_lines.append(f"📦 COLMAP: {colmap_sparse_dir} (✅ スキップモード準備完了)")
-                result_lines.append(f"📦 歪み補正画像: {colmap_images_dir}")
-            else:
-                result_lines.append("⚠ COLMAPエクスポート: ファイルが不完全（Docker COLMAP フォールバック使用）")
-
-            maps_files = glob.glob(os.path.join(maps_dir, "*")) if os.path.isdir(maps_dir) else []
-            if maps_files:
-                result_lines.append(f"📦 深度/法線マップ: {maps_dir} ({len(maps_files)} files)")
-
         if run_3dgs_enabled:
             result_lines.append("")
             if colmap_skip_ready:
                 result_lines.append("🔥 3DGS (FastGS) バックグラウンド学習開始 — ⚡ COLMAPスキップモード")
             else:
-                result_lines.append("🔥 3DGS (FastGS) バックグラウンド学習開始 — 従来モード (Docker COLMAP)")
+                result_lines.append("🔥 3DGS (FastGS) バックグラウンド学習開始 — Docker COLMAP + 学習")
             result_lines.append("   学習状況は「3DGS / PLY ビューワー」タブから確認できます。")
             threading.Thread(target=run_fastgs_backend, args=(safe_name,), daemon=True).start()
 

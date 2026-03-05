@@ -642,19 +642,27 @@ def convert_to_3d(files, project_name, quality,
     cmd.append("-align")
     cmd.append("-setReconstructionRegionAuto")
 
-    # --- 広域モード: コンポーネント結合 ---
+    # --- 広域モード: コンポーネント結合（アライメント操作 — メッシュ生成前に実行） ---
     if wide_area_enabled:
         cmd.append("-mergeComponents")
-        cmd.append("-closeHoles")
 
-    # --- メッシュ生成 ---
+    # --- 最大コンポーネント選択（メッシュ生成前に実行 — 複数コンポーネント時に必要） ---
+    cmd.append("-selectMaximalComponent")
+
+    # --- メッシュ生成（生成後はモデルが自動選択される） ---
     cmd.append(quality_flag)
-    cmd += ["-renameSelectedModel", "output_model"]
+
+    # --- 広域モード: 穴埋め（メッシュ操作 — メッシュ生成後に実行） ---
+    if wide_area_enabled:
+        cmd.append("-closeHoles")
 
     if simplify_enabled:
         cmd += ["-simplify", str(int(simplify_count))]
     if smooth_enabled:
         cmd.append("-smooth")
+
+    # --- 処理後のモデルを命名 ---
+    cmd += ["-renameSelectedModel", "output_model"]
 
     # --- テクスチャ設定 ---
     cmd += ["-set", f"unwrapMaximalTexCount={effective_tex_count}"]
@@ -843,6 +851,7 @@ def convert_to_3d(files, project_name, quality,
 
         result_lines = [
             "--- 変換完了 ---",
+            f"⏱ 変換時間: {int((time.time() - before_time) // 60)}分{int((time.time() - before_time) % 60):02d}秒",
             "",
             f"📦 GLB: {os.path.basename(expected)} ({glb_size:.1f} MB)",
         ]
